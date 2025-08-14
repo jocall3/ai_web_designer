@@ -1,0 +1,21 @@
+
+# Use the official Python 3.10 slim image
+FROM python:3.10-slim
+
+# Set the working directory in the container
+WORKDIR /code
+
+# Copy the requirements file into the container
+COPY ./requirements.txt /code/requirements.txt
+
+# Install the Python dependencies
+RUN pip install --no-cache-dir --upgrade -r /code/requirements.txt
+
+# Copy the application script into the container
+COPY ./app.py.txt /code/app.py
+
+# Expose the port Gradio runs on
+EXPOSE 7860
+
+# Command to run the application
+CMD ["python", "/code/app.py"]

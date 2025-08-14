@@ -1,0 +1,690 @@
+
+import gradio as gr
+import os
+# Updated import to use the new 'google.genai' SDK
+from google import genai
+from google.genai import types
+import json
+from PIL import Image
+from io import BytesIO
+import base64
+import uuid
+import concurrent.futures
+import re
+import tempfile
+
+# --- Configuration and Initialization ---
+
+# Get the API key from environment variables
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY not found in environment variables. Please set it in your Hugging Face Space secrets.")
+
+# Initialize Gemini client
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+
+# --- Default Data Structures (Ported from TypeScript) ---
+
+DEFAULT_WEBSITE_SETTINGS = {
+    "theme": {
+        "appBg": "#111827", "panelBg": "#1f2937", "headerBg": "#1f2937",
+        "footerBg": "#1f2937", "primaryTextColor": "#f9fafb", "secondaryTextColor": "#d1d5db",
+        "primaryAccent": "#4f46e5", "secondaryAccent": "#10b981", "fontFamily": "font-sans",
+    },
+    "header": { "title": "My Awesome Site", "logoUrl": "", "navLinks": [] },
+    "footer": {
+        "text": "© 2024 My Awesome Site. All rights reserved.",
+        "links": [
+            {"text": "Privacy Policy", "href": "#"},
+            {"text": "Terms of Service", "href": "#"},
+        ],
+    },
+    "pages": [{
+        "path": "index.html", "name": "Home",
+        "contentBlocks": [{
+            "id": str(uuid.uuid4()), "type": "hero", "headline": "Welcome to Your AI-Generated Website",
+            "subheadline": "Describe your vision and watch it come to life.",
+            "bgImage": "", "headlineColor": "#ffffff", "subheadlineColor": "#d1d5db",
+        }],
+    }],
+}
+
+# --- Core AI and Helper Functions ---
+
+def create_prompt_from_answers(answers):
+    # This prompt is a direct port from the React app, instructing the AI on how to generate the website layout.
+    return f"""
+You are a world-class creative director, UI/UX designer, and content strategist tasked with building a complete multi-page website.
+The user has provided the following details through a questionnaire. Your task is to interpret their answers and generate a cohesive and complete website design.
+
+**User's Website Requirements:**
+- **Website Name:** {answers.get('name', 'AI Generated Website')}
+- **Core Purpose:** {answers.get('purpose', 'Not specified')}
+- **Target Audience:** {answers.get('audience', 'General audience')}
+- **Desired Style/Vibe:** {answers.get('style', 'A modern, clean design')}
+- **Color Palette:** {answers.get('colors', 'A balanced color scheme based on the style')}
+- **Theme Preference:** {answers.get('theme', 'dark')}
+- **Required Pages:** {answers.get('pages', 'Home, About, Contact')}
+- **Home Page Headline/Message:** {answers.get('homeMessage', f"Welcome to {answers.get('name', 'Our Website')}")}
+- **Key Features/Services:** {answers.get('features', 'Feature 1, Feature 2, Feature 3')}
+- **About Us Content:** {answers.get('about', 'A brief description of the company.')}
+- **Contact Info:** {answers.get('contact', 'A contact form.')}
+- **Brand Tone of Voice:** {answers.get('tone', 'Professional and friendly')}
+- **Tagline:** {answers.get('tagline', '')}
+- **Additional Instructions:** {answers.get('extra', 'None')}
+
+**Your Mission:**
+Based *only* on the requirements above, generate a single, comprehensive JSON object for this website. Adhere strictly to the provided JSON schema.
+
+**Mandatory Requirements:**
+1.  **Page Creation:** Create pages based on the user's request ({answers.get('pages')}). If not specified, create a logical set of pages (e.g., Home, About, Services, Contact).
+2.  **Cohesive Branding:** The theme (colors, fonts) and all generated content (text, image prompts) must be consistent with the user's described style ({answers.get('style')}, {answers.get('colors')}, {answers.get('theme')}).
+3.  **Content Generation:** Write compelling copy for all text blocks, headlines, and features, adopting the user's desired tone ({answers.get('tone')}). The content should directly relate to the website's purpose ({answers.get('purpose')}) and features ({answers.get('features')}).
+4.  **Creative Asset Prompts:** Generate 1 distinct, creative prompts for logos that match the brand identity. Also, create a unique, descriptive image prompt for every single image required in the content blocks.
+5.  **Navigation:** Populate the 'navLinks' array in the header settings. The links must correspond to the pages you create.
+6.  **Data Integrity:** All paths must be unique and end in '.html'. All block IDs must be unique. Use valid hex color codes with good accessibility contrast. For forms, include relevant fields.
+7.  **Image Limit:** The total number of `blockImagePrompts` you generate must **NOT exceed 9**. Be selective and only create images for the most important content blocks to stay within this limit.
+"""
+
+def generate_image(prompt: str, aspect_ratio: str):
+    """Generates an image using Gemini and returns a file path and a base64 data URL."""
+    print(f"Generating image for prompt: {prompt}")
+    try:
+        # Refactored to use the new client.models.generate_content method
+        full_prompt = f'Generate a single, high-quality image. Description: "{prompt}". The image should have a {aspect_ratio} aspect ratio.'
+        
+        response = client.models.generate_content(
+            model="gemini-2.0-flash-preview-image-generation",
+            contents=full_prompt,
+            config=types.GenerateContentConfig(response_modalities=['TEXT', 'IMAGE'])
+        )
+        
+        image_part = next((part for part in response.candidates[0].content.parts if part.inline_data), None)
+
+        if image_part:
+            mime_type = image_part.inline_data.mime_type
+            image_data = image_part.inline_data.data
+
+            # Create base64 URL
+            base64_data = base64.b64encode(image_data).decode("utf-8")
+            base64_url = f"data:{mime_type};base64,{base64_data}"
+
+            # Save to temp file
+            extension = mime_type.split('/')[-1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{extension}") as temp_file:
+                temp_file.write(image_data)
+                temp_filepath = temp_file.name
+            
+            return temp_filepath, base64_url
+        else:
+            print(f"Warning: Image generation failed for prompt: {prompt}. No image data in response.")
+            return None, None
+    except Exception as e:
+        print(f"Error generating image for prompt '{prompt}': {e}")
+        return None, None
+
+def generate_page_html(page, settings):
+    """Generates the HTML for a single page based on the website settings."""
+    if not page or not settings:
+        return "<p>Error: Page or settings not found.</p>"
+
+    theme = settings.get("theme", {})
+    header = settings.get("header", {})
+    footer = settings.get("footer", {})
+    nav_links = header.get("navLinks", [])
+    
+    # Header HTML
+    header_html = f"""
+    <header style="background-color: {theme.get('headerBg')}; color: {theme.get('primaryTextColor')}; padding: 1rem 2rem;">
+        <div class="container mx-auto flex justify-between items-center">
+            <div class="flex items-center space-x-4">
+                {'<img src="' + header.get('logoUrl', '') + '" alt="Logo" class="h-10 w-10 object-contain bg-white rounded-full p-1">' if header.get('logoUrl') else ''}
+                <a href="index.html" class="text-2xl font-bold">{header.get('title', '')}</a>
+            </div>
+            <div class="hidden md:flex items-center space-x-6">
+                {''.join([f'<a href="{link.get("href")}" style="color: {theme.get("secondaryTextColor")};" class="hover:text-white transition-colors {"font-bold !text-white" if page.get("path") == link.get("href") else ""}">{link.get("text")}</a>' for link in nav_links])}
+            </div>
+        </div>
+    </header>
+    """
+
+    # Content Blocks HTML
+    main_content_html = ""
+    for block in page.get("contentBlocks", []):
+        block_type = block.get("type")
+        if block_type == 'hero':
+            main_content_html += f"""
+            <section class="text-center flex flex-col items-center justify-center min-h-[50vh] p-8" style="background-image: linear-gradient(rgba(0,0,0,0.4), rgba(0,0,0,0.4)), url({block.get('bgImage', '')}); background-size: cover; background-position: center;">
+                <h2 class="text-4xl md:text-6xl font-bold" style="color: {block.get('headlineColor', '#ffffff')};">{block.get('headline', '')}</h2>
+                <p class="mt-4 text-lg md:text-xl max-w-2xl" style="color: {block.get('subheadlineColor', '#d1d5db')};">{block.get('subheadline', '')}</p>
+            </section>"""
+        elif block_type == 'textWithImage':
+            text_html = (block.get('text', '') or '').replace('\n', '<br/>')
+            main_content_html += f"""
+            <section class="container mx-auto py-12 md:py-20 px-6">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-12 items-center">
+                    <div class="{'md:order-1' if block.get('imagePosition') == 'right' else 'md:order-2'}">
+                        <h3 class="text-3xl font-bold mb-4" style="color: {theme.get('primaryTextColor')};">{block.get('headline', '')}</h3>
+                        <p style="color: {theme.get('secondaryTextColor')};">{text_html}</p>
+                    </div>
+                    <div class="{'md:order-2' if block.get('imagePosition') == 'right' else 'md:order-1'}">
+                        <img src="{block.get('image', '')}" alt="{block.get('headline', 'content image')}" class="rounded-lg shadow-xl w-full h-auto object-cover aspect-square">
+                    </div>
+                </div>
+            </section>"""
+        elif block_type == 'featureList':
+            features_html = ''.join([f"""
+                <div class="p-6 rounded-lg" style="background-color: {theme.get('panelBg')};">
+                    <h4 class="text-xl font-bold mb-2" style="color: {theme.get('primaryAccent')};">{f.get('title', '')}</h4>
+                    <p style="color: {theme.get('secondaryTextColor')};">{f.get('description', '')}</p>
+                </div>""" for f in block.get('features', [])])
+            main_content_html += f"""
+            <section class="container mx-auto py-12 md:py-20 px-6">
+                <h2 class="text-4xl font-bold text-center mb-12" style="color: {theme.get('primaryTextColor')};">{block.get('headline', '')}</h2>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-8">{features_html}</div>
+            </section>"""
+        elif block_type == 'text':
+             paragraphs_html = ''.join([f'<p>{p}</p>' for p in block.get('paragraphs', [])])
+             main_content_html += f"""
+             <section class="container mx-auto py-12 md:py-20 px-6 max-w-4xl">
+                <h2 class="text-4xl font-bold text-center mb-12" style="color: {theme.get('primaryTextColor')};">{block.get('headline', '')}</h2>
+                <div class="prose prose-invert lg:prose-xl mx-auto" style="color: {theme.get('secondaryTextColor')};">{paragraphs_html}</div>
+             </section>
+             """
+        elif block_type == 'form':
+            fields_html = ''.join([f"""
+                <div>
+                    <label for="{f.get('name')}" class="block text-sm font-medium mb-1" style="color: {theme.get('secondaryTextColor')};">{f.get('label', '')}</label>
+                    <input type="{f.get('type')}" name="{f.get('name')}" id="{f.get('name')}" class="w-full rounded-md p-2 text-sm" style="background-color: {theme.get('appBg')}; color: {theme.get('primaryTextColor')}; border: 1px solid {theme.get('panelBg')};" />
+                </div>""" for f in block.get('fields', [])])
+            main_content_html += f"""
+            <section class="container mx-auto py-12 md:py-20 px-6 flex justify-center">
+                <div class="w-full max-w-md p-8 rounded-lg" style="background-color: {theme.get('panelBg')};">
+                    <h2 class="text-3xl font-bold text-center mb-8" style="color: {theme.get('primaryTextColor')};">{block.get('headline', '')}</h2>
+                    <form class="space-y-6" onsubmit="event.preventDefault(); alert('Form submitted! (This is a preview)');">
+                        {fields_html}
+                        <div><button type="submit" class="w-full flex items-center justify-center p-2 text-white font-semibold rounded-md transition-colors" style="background-color: {theme.get('secondaryAccent')};">{block.get('submitButtonText', 'Submit')}</button></div>
+                    </form>
+                </div>
+            </section>"""
+
+    # Footer HTML
+    footer_html = f"""
+    <footer style="background-color: {theme.get('footerBg')}; color: {theme.get('secondaryTextColor')};" class="py-6 px-4 mt-auto">
+        <div class="container mx-auto text-center">
+            <p>{footer.get('text', '')}</p>
+            <div class="mt-2 flex justify-center space-x-4">
+                {''.join([f'<a href="{link.get("href")}" class="hover:text-white transition-colors">{link.get("text")}</a>' for link in footer.get("links", [])])}
+            </div>
+        </div>
+    </footer>
+    """
+
+    # Final Page Assembly
+    return f"""
+<!DOCTYPE html>
+<html lang="en" class="{theme.get('fontFamily', 'font-sans')}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{header.get('title', '')} - {page.get('name', '')}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {{
+            theme: {{
+                extend: {{
+                    typography: ({{ theme }}) => ({{
+                        invert: {{
+                            css: {{
+                                '--tw-prose-body': theme('colors.gray[300]'),
+                                '--tw-prose-headings': theme('colors.white'),
+                                '--tw-prose-links': theme('colors.white'),
+                                '--tw-prose-bold': theme('colors.white'),
+                            }},
+                        }},
+                    }}),
+                }},
+            }}
+        }}
+    </script>
+</head>
+<body style="background-color: {theme.get('appBg')};" class="flex flex-col min-h-screen">
+    {header_html}
+    <main>{main_content_html}</main>
+    {footer_html}
+    <script>
+        // Prevent iframe navigation from redirecting the whole page
+        document.addEventListener('click', function (e) {{
+            let target = e.target;
+            while (target && target.tagName !== 'A') {{
+                target = target.parentElement;
+            }}
+            if (target && target.tagName === 'A') {{
+                const href = target.getAttribute('href');
+                if (href && !href.startsWith('#') && !href.startsWith('http')) {{
+                    e.preventDefault();
+                    // In a real scenario, you'd postMessage to the parent,
+                    // but Gradio's buttons will handle navigation instead.
+                    alert(`Preview navigation to: ${'{href}'}`);
+                }}
+            }}
+        }});
+    </script>
+</body>
+</html>
+    """.strip()
+
+
+# --- Gradio UI Definition ---
+
+def create_gradio_app():
+    
+    # --- UI Helper Functions ---
+    def get_page_by_path(path, settings):
+        return next((p for p in settings.get("pages", []) if p.get("path") == path), None)
+
+    def get_block_by_id(page, block_id):
+        if not page: return None
+        return next((b for b in page.get("contentBlocks", []) if b.get("id") == block_id), None)
+
+    # --- Event Handlers ---
+
+    def handle_start():
+        return {
+            welcome_view: gr.update(visible=False),
+            questionnaire_view: gr.update(visible=True),
+        }
+
+    def handle_generate_layout(*questionnaire_answers):
+        yield {
+            questionnaire_view: gr.update(visible=False),
+            generating_view: gr.update(visible=True),
+            status_text: "Generating website structure..."
+        }
+        
+        # Map flat answer list to dictionary
+        question_ids = [
+            'name', 'purpose', 'audience', 'style', 'colors', 'theme', 'pages', 
+            'homeMessage', 'features', 'about', 'tone', 'tagline', 'extra'
+        ]
+        answers = dict(zip(question_ids, questionnaire_answers))
+        
+        # --- Step 1: Generate Layout ---
+        try:
+            # Refactored to use the new client.models.generate_content method
+            prompt = create_prompt_from_answers(answers)
+            schema = {
+                "type": "object",
+                "properties": {
+                    "websiteSettings": {
+                        "type": "object",
+                        "properties": {
+                            "theme": {"type": "object", "properties": {"appBg": {"type": "string"},"panelBg": {"type": "string"},"headerBg": {"type": "string"},"footerBg": {"type": "string"},"primaryTextColor": {"type": "string"},"secondaryTextColor": {"type": "string"},"primaryAccent": {"type": "string"},"secondaryAccent": {"type": "string"},"fontFamily": {"type": "string"}}},
+                            "header": {"type": "object", "properties": {"title": {"type": "string"},"navLinks": {"type": "array","items": {"type": "object","properties": {"text": {"type": "string"},"href": {"type": "string"}}}}}},
+                            "footer": {"type": "object", "properties": {"text": {"type": "string"},"links": {"type": "array","items": {"type": "object","properties": {"text": {"type": "string"},"href": {"type": "string"}}}}}},
+                            "pages": {"type": "array","items": {"type": "object","properties": {"path": {"type": "string"},"name": {"type": "string"},"contentBlocks": {"type": "array","items": {"type": "object", "properties": { "id": {"type": "string"}, "type": {"type": "string"}, "headline": {"type": "string"}, "subheadline": {"type": "string"}, "headlineColor": {"type": "string"}, "subheadlineColor": {"type": "string"}, "text": {"type": "string"}, "imagePosition": {"type": "string"}, "features": {"type": "array", "items": {"type": "object", "properties": {"title": {"type": "string"}, "description": {"type": "string"}}}},"fields": {"type": "array","items": {"type": "object","properties": {"label": {"type": "string"},"type": {"type": "string"},"name": {"type": "string"}}}},"submitButtonText": {"type": "string"}, "paragraphs": {"type": "array", "items": {"type": "string"}}}}}}}},
+                        },
+                    },
+                    "imagePrompts": {
+                        "type": "object",
+                        "properties": {
+                            "logoPrompts": {"type": "array", "items": {"type": "string"}},
+                            "blockImagePrompts": {"type": "array", "items": {"type": "object", "properties": {"pagePath": {"type": "string"},"blockId": {"type": "string"},"prompt": {"type": "string"}}}}
+                        }
+                    }
+                }
+            }
+            
+            safety_settings = [
+                {
+                    "category": types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                    "threshold": types.HarmBlockThreshold.BLOCK_NONE,
+                },
+                {
+                    "category": types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                    "threshold": types.HarmBlockThreshold.BLOCK_NONE,
+                },
+                {
+                    "category": types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                    "threshold": types.HarmBlockThreshold.BLOCK_NONE,
+                },
+                {
+                    "category": types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                    "threshold": types.HarmBlockThreshold.BLOCK_NONE,
+                },
+            ]
+
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=schema,
+                    safety_settings=safety_settings
+                )
+            )
+            design_plan = json.loads(response.text)
+        except Exception as e:
+            print(f"Layout generation failed: {e}")
+            yield {
+                generating_view: gr.update(visible=False),
+                questionnaire_view: gr.update(visible=True),
+                error_box: gr.update(value=f"Error generating layout: {e}", visible=True)
+            }
+            return
+
+        new_settings = design_plan['websiteSettings']
+        image_prompts = design_plan['imagePrompts']
+        
+        # Add unique IDs and empty image fields to the settings
+        original_id_map = {}
+        for page in new_settings.get('pages', []):
+            new_blocks = []
+            for block in page.get('contentBlocks', []):
+                new_id = str(uuid.uuid4())
+                original_id = block.get('id')
+                if original_id:
+                    original_id_map[original_id] = new_id
+                
+                block['id'] = new_id
+                if block.get('type') == 'hero':
+                    block['bgImage'] = ''
+                if block.get('type') == 'textWithImage':
+                    block['image'] = ''
+                new_blocks.append(block)
+            page['contentBlocks'] = new_blocks
+        new_settings['header']['logoUrl'] = ''
+
+        active_page_path = new_settings['pages'][0]['path'] if new_settings.get('pages') else ''
+        
+        # --- Step 2: Generate Images in Parallel ---
+        tasks = []
+        logo_prompts = [re.sub(r'import\s.*', '', p).strip() for p in image_prompts.get('logoPrompts', [])]
+        block_prompts = image_prompts.get('blockImagePrompts', [])
+        
+        if logo_prompts:
+            yield {status_text: f"Generating {len(logo_prompts)} logos..."}
+            for prompt in logo_prompts:
+                tasks.append(("logo", prompt))
+
+        if block_prompts:
+            yield {status_text: f"Generating {len(block_prompts)} content images..."}
+            for p_info in block_prompts:
+                p_info['prompt'] = re.sub(r'import\s.*', '', p_info.get('prompt', '')).strip()
+                tasks.append(("block", p_info))
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_task = {executor.submit(generate_image, task[1]['prompt'] if task[0]=='block' else task[1], '16:9' if task[0]=='block' and task[1].get('type')=='hero' else '1:1'): task for task in tasks}
+            
+            logo_filepaths = []
+            logo_base64s = []
+            for i, future in enumerate(concurrent.futures.as_completed(future_to_task)):
+                task_type, task_data = future_to_task[future]
+                try:
+                    filepath, base64_url = future.result()
+                    if not filepath or not base64_url: continue
+
+                    if task_type == "logo":
+                        logo_filepaths.append(filepath)
+                        logo_base64s.append(base64_url)
+                    
+                    elif task_type == "block":
+                        original_block_id = task_data['blockId']
+                        new_block_id = original_id_map.get(original_block_id)
+                        if not new_block_id: continue
+
+                        page_path = task_data['pagePath']
+                        page_to_update = get_page_by_path(page_path, new_settings)
+                        if not page_to_update: continue
+                        
+                        block_to_update = get_block_by_id(page_to_update, new_block_id)
+                        if not block_to_update: continue
+
+                        key_to_update = 'bgImage' if block_to_update.get('type') == 'hero' else 'image'
+                        block_to_update[key_to_update] = base64_url
+                        
+                    yield {status_text: f"Processing images... ({i+1}/{len(tasks)})"}
+
+                except Exception as exc:
+                    print(f'{task_data} generated an exception: {exc}')
+
+        yield {
+            generating_view: gr.update(visible=False),
+            logo_picker_view: gr.update(visible=True),
+            logo_gallery: gr.update(value=logo_filepaths if logo_filepaths else []),
+            website_settings_state: new_settings,
+            active_page_path_state: active_page_path,
+            generated_logos_state: logo_base64s
+        }
+        
+    def handle_logo_select(evt: gr.SelectData, settings, active_path, all_logo_base64s):
+        selected_index = evt.index
+        logo_url = all_logo_base64s[selected_index]
+        settings['header']['logoUrl'] = logo_url
+        
+        page = get_page_by_path(active_path, settings)
+        html = generate_page_html(page, settings)
+        
+        # Update controls with the new settings
+        page_names = [p['name'] for p in settings['pages']]
+        active_page_name = get_page_by_path(active_path, settings)['name']
+        
+        return {
+            logo_picker_view: gr.update(visible=False),
+            preview_view: gr.update(visible=True),
+            website_settings_state: settings,
+            html_preview: html,
+            code_preview: html,
+            # Update controls
+            page_selector: gr.update(choices=page_names, value=active_page_name),
+            header_title_input: settings['header']['title'],
+            footer_text_input: settings['footer']['text'],
+            theme_app_bg_input: settings['theme']['appBg'],
+            theme_panel_bg_input: settings['theme']['panelBg'],
+            theme_header_bg_input: settings['theme']['headerBg'],
+            theme_footer_bg_input: settings['theme']['footerBg'],
+            theme_primary_text_input: settings['theme']['primaryTextColor'],
+            theme_secondary_text_input: settings['theme']['secondaryTextColor'],
+            theme_primary_accent_input: settings['theme']['primaryAccent'],
+            theme_secondary_accent_input: settings['theme']['secondaryAccent'],
+            theme_font_family_input: settings['theme']['fontFamily'],
+        }
+
+    def handle_page_change(page_name, settings):
+        path = next((p['path'] for p in settings['pages'] if p['name'] == page_name), None)
+        if not path: return {}
+        
+        page = get_page_by_path(path, settings)
+        html = generate_page_html(page, settings)
+        
+        # Create dynamic controls for the selected page's content blocks
+        content_controls = []
+        # This part is complex with Gradio's current API for dynamic updates based on state.
+        # For this example, we'll keep it simple and not dynamically generate inputs,
+        # relying on a more complex (and currently absent) handle_content_change function.
+        
+        return {
+            active_page_path_state: path,
+            html_preview: html,
+            code_preview: html,
+            # page_content_controls: gr.update(value=content_controls) # Dynamic controls are tricky
+        }
+        
+    def handle_setting_change(settings, path, *values):
+        # This is a simplified handler. It assumes the order of values matches the controls.
+        # A more robust solution would use elem_id to map values to settings.
+        settings['header']['title'] = values[0]
+        settings['footer']['text'] = values[1]
+        theme_keys = list(settings['theme'].keys())
+        for i, key in enumerate(theme_keys):
+            settings['theme'][key] = values[2 + i]
+
+        page = get_page_by_path(path, settings)
+        html = generate_page_html(page, settings)
+        return settings, html, html
+
+    def handle_content_change(request: gr.Request, settings, active_path, *content_values):
+        # A very basic content handler based on elem_id.
+        # Gradio's current API makes granular updates complex.
+        # This is a placeholder for a more robust implementation.
+        
+        # Example of how one would update:
+        # changed_elem_id = request.elem_id
+        # new_value = content_values[??]
+        # path, block_id, field = changed_elem_id.split('_')
+        # page = get_page_by_path(path, settings)
+        # block = get_block_by_id(page, block_id)
+        # block[field] = new_value
+
+        page = get_page_by_path(active_path, settings)
+        html = generate_page_html(page, settings)
+        return settings, html, html
+
+    # --- Gradio Blocks ---
+    with gr.Blocks(theme=gr.themes.Default(primary_hue="blue", secondary_hue="indigo"), css="""
+        .gradio-container { background-color: #0d1117; }
+        #logo-picker .thumbnail-item { height: 120px !important; width: 120px !important; }
+    """) as demo:
+        # --- State Management ---
+        website_settings_state = gr.State(DEFAULT_WEBSITE_SETTINGS)
+        active_page_path_state = gr.State("index.html")
+        generated_logos_state = gr.State([])
+
+        # --- View: Welcome ---
+        with gr.Column(visible=True) as welcome_view:
+            gr.Markdown("# 🚀 AI Website Architect\nWelcome! Instead of code, you'll answer a series of questions about your vision. Our AI will then act as your creative director, designer, and content strategist to generate a complete, multi-page website tailored to your needs—from brand identity and color schemes to page layouts and content.",)
+            start_button = gr.Button("Start Building Your Website", variant="primary")
+
+        # --- View: Questionnaire ---
+        with gr.Column(visible=False) as questionnaire_view:
+            gr.Markdown("# 📝 Build Your Website\nAnswer these questions to give the AI a creative brief for your project.")
+            error_box = gr.Textbox(label="Error", visible=False, interactive=False)
+            
+            # Pre-filled answers for quick testing
+            default_answers = {
+                'name': 'QuantumBank', 'purpose': 'A high-tech financial company exploring the intersection of quantum computing and finance.',
+                'audience': 'Investors, researchers, and tech enthusiasts interested in fintech.', 'style': 'Dark, futuristic, and professional with a high-tech feel.',
+                'colors': 'Deep blues, purples, with bright cyan accents.', 'theme': 'dark', 'pages': 'Home, About Us, Research, Philosophy, Contact',
+                'homeMessage': 'QuantumBank: The Future of Finance is Here.', 'features': '- Quantum-secured transactions\n- AI-powered investment analysis\n- Decentralized financial instruments',
+                'about': 'Founded by leading quantum physicists and financial experts, QuantumBank is pioneering the next generation of financial technology.',
+                'tone': 'Authoritative, innovative, and forward-thinking.', 'tagline': 'Banking at the speed of light.', 'extra': 'The design should feel sleek and sophisticated, almost like science fiction made real.'
+            }
+
+            with gr.Accordion("Core Identity", open=True):
+                q_name = gr.Textbox(label="Website/Company Name", value=default_answers['name'])
+                q_purpose = gr.Textbox(label="Primary Purpose", lines=3, value=default_answers['purpose'])
+                q_audience = gr.Textbox(label="Target Audience", lines=3, value=default_answers['audience'])
+            with gr.Accordion("Aesthetics", open=True):
+                q_style = gr.Textbox(label="Overall Style/Vibe", value=default_answers['style'])
+                q_colors = gr.Textbox(label="Preferred Colors", value=default_answers['colors'])
+                q_theme = gr.Radio(label="Theme", choices=["dark", "light"], value=default_answers['theme'])
+            with gr.Accordion("Content & Structure", open=True):
+                q_pages = gr.Textbox(label="Required Pages", value=default_answers['pages'])
+                q_homeMessage = gr.Textbox(label="Home Page Message/Headline", value=default_answers['homeMessage'])
+                q_features = gr.Textbox(label="Key Features/Services", lines=3, value=default_answers['features'])
+                q_about = gr.Textbox(label="About Us Content", lines=4, value=default_answers['about'])
+            with gr.Accordion("Brand Voice & Final Touches", open=True):
+                q_tone = gr.Textbox(label="Tone of Voice", value=default_answers['tone'])
+                q_tagline = gr.Textbox(label="Tagline/Slogan", value=default_answers['tagline'])
+                q_extra = gr.Textbox(label="Additional Instructions", lines=3, value=default_answers['extra'])
+
+            questionnaire_inputs = [q_name, q_purpose, q_audience, q_style, q_colors, q_theme, q_pages, q_homeMessage, q_features, q_about, q_tone, q_tagline, q_extra]
+            generate_button = gr.Button("Generate My Website", variant="primary")
+
+        # --- View: Generating ---
+        with gr.Column(visible=False, elem_id="generating-view") as generating_view:
+            gr.Markdown("## ⏳ Generating Your Website...")
+            status_text = gr.Textbox("Initializing...", label="Status", interactive=False)
+
+        # --- View: Logo Picker ---
+        with gr.Column(visible=False) as logo_picker_view:
+            gr.Markdown("## ✨ Choose Your Logo\nThe AI has generated these logo options. Pick your favorite to continue.")
+            logo_gallery = gr.Gallery(label="Logo Options", columns=1, object_fit="contain", elem_id="logo-picker")
+
+        # --- View: Preview & Editor ---
+        with gr.Row(visible=False) as preview_view:
+            with gr.Column(scale=1):
+                gr.Markdown("## 🛠️ Website Editor")
+                with gr.Tabs():
+                    with gr.TabItem("Pages & Content"):
+                        page_selector = gr.Radio(label="Select Page to Edit", choices=["Home"], value="Home")
+                        # Dynamic content controls are complex in Gradio, so we'll omit them for simplicity
+                        gr.Markdown("*(Content editing is simplified for this demo. Changes can be made in the generated code.)*")
+
+                    with gr.TabItem("Global Settings"):
+                        with gr.Accordion("Header & Footer", open=True):
+                           header_title_input = gr.Textbox(label="Header: Site Title")
+                           footer_text_input = gr.Textbox(label="Footer: Copyright Text")
+                    with gr.TabItem("Theme"):
+                        with gr.Accordion("Colors", open=True):
+                           theme_app_bg_input = gr.ColorPicker(label="App Background")
+                           theme_panel_bg_input = gr.ColorPicker(label="Panel Background")
+                           theme_header_bg_input = gr.ColorPicker(label="Header Background")
+                           theme_footer_bg_input = gr.ColorPicker(label="Footer Background")
+                           theme_primary_text_input = gr.ColorPicker(label="Primary Text")
+                           theme_secondary_text_input = gr.ColorPicker(label="Secondary Text")
+                           theme_primary_accent_input = gr.ColorPicker(label="Primary Accent")
+                           theme_secondary_accent_input = gr.ColorPicker(label="Secondary Accent")
+                        with gr.Accordion("Font", open=True):
+                           theme_font_family_input = gr.Dropdown(label="Font Family", choices=['font-sans', 'font-serif', 'font-mono'])
+            with gr.Column(scale=3):
+                with gr.Tabs():
+                    with gr.TabItem("Live Preview"):
+                        html_preview = gr.HTML(value="<p>Your website preview will appear here.</p>",)
+                    with gr.TabItem("Embed Code"):
+                        code_preview = gr.Code(language="html", label="HTML Code")
+
+        # --- Event Wiring ---
+        start_button.click(handle_start, outputs=[welcome_view, questionnaire_view])
+        
+        generate_button.click(
+            handle_generate_layout,
+            inputs=questionnaire_inputs,
+            outputs=[
+                questionnaire_view, generating_view, status_text, error_box,
+                logo_picker_view, logo_gallery, website_settings_state, active_page_path_state,
+                generated_logos_state
+            ]
+        )
+        
+        logo_gallery.select(
+            handle_logo_select,
+            inputs=[website_settings_state, active_page_path_state, generated_logos_state],
+            outputs=[
+                logo_picker_view, preview_view, website_settings_state, html_preview, code_preview,
+                page_selector, header_title_input, footer_text_input,
+                theme_app_bg_input, theme_panel_bg_input, theme_header_bg_input, theme_footer_bg_input,
+                theme_primary_text_input, theme_secondary_text_input, theme_primary_accent_input,
+                theme_secondary_accent_input, theme_font_family_input
+            ]
+        )
+        
+        page_selector.change(
+            handle_page_change,
+            inputs=[page_selector, website_settings_state],
+            outputs=[active_page_path_state, html_preview, code_preview]
+        )
+        
+        # Consolidate setting controls for easier handling
+        setting_controls = [
+            header_title_input, footer_text_input,
+            theme_app_bg_input, theme_panel_bg_input, theme_header_bg_input, theme_footer_bg_input,
+            theme_primary_text_input, theme_secondary_text_input, theme_primary_accent_input,
+            theme_secondary_accent_input, theme_font_family_input
+        ]
+        
+        for control in setting_controls:
+            control.change(
+                handle_setting_change,
+                inputs=[website_settings_state, active_page_path_state] + setting_controls,
+                outputs=[website_settings_state, html_preview, code_preview]
+            )
+
+    return demo
+
+
+if __name__ == "__main__":
+    app = create_gradio_app()
+    # To run in a Hugging Face Space, the port must be 7860
+    app.launch(server_name="0.0.0.0", server_port=7860)

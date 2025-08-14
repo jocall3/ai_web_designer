@@ -1,0 +1,6 @@
+{
+  "name": "webgen",
+  "description": "A powerful tool to generate complete, multi-page websites from a single text prompt. The AI acts as a creative director to design a cohesive theme, header, footer, and page-specific content blocks, generating all logos, images, and text content for a full web presence.",
+  "requestFramePermissions": [],
+  "prompt": ""
+}
