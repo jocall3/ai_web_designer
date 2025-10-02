@@ -1,3 +1,6 @@
+// Copyright James Burvel O’Callaghan III
+// President Citibank Demo Business Inc.
+
 
 import { WebsiteSettings, ThemeSettings, HeaderSettings, FooterSettings, Page, HeroBlock } from './types';
 import { nanoid } from 'https://esm.sh/nanoid';
